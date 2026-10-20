@@ -75,8 +75,11 @@ if(MSVC)
     target_compile_options(motion_correction_cpp_base PRIVATE /W4 /arch:AVX)
 else()
     # GCC/Clang flags (also applies to MinGW on Windows)
-    # Enable SSE4.1 and AVX instructions for SIMD operations
-    target_compile_options(motion_correction_cpp_base PRIVATE -Wall -Wextra -msse4.1 -mavx)
+    target_compile_options(motion_correction_cpp_base PRIVATE -Wall -Wextra)
+    # Enable SSE4.1 and AVX instructions for SIMD operations (x86 only; ARM e.g. Apple Silicon has no such flags)
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i[3-6]86")
+        target_compile_options(motion_correction_cpp_base PRIVATE -msse4.1 -mavx)
+    endif()
 endif()
 
 # Python bindings

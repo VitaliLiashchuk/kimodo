@@ -35,6 +35,10 @@ def _quaternion_slerp(q0: torch.Tensor, q1: torch.Tensor, t: torch.Tensor) -> to
     sin_theta = torch.sin(theta_0)
     s0 = torch.sin((1.0 - t) * theta_0) / sin_theta.clamp(min=1e-8)
     s1 = torch.sin(t * theta_0) / sin_theta.clamp(min=1e-8)
+    # near-identical rotations: sin(theta) ~ 0 makes both weights 0 (zero quaternion -> NaN), so lerp instead
+    near = sin_theta < 1e-6
+    s0 = torch.where(near, 1.0 - t, s0)
+    s1 = torch.where(near, t, s1)
     q = s0 * q0 + s1 * q1
     return q / torch.linalg.norm(q, dim=-1, keepdim=True).clamp(min=1e-8)
 

@@ -6,7 +6,12 @@
 #pragma once
 
 #include <stdint.h>
-#include <immintrin.h>
+#if defined(__aarch64__) || defined(_M_ARM64)
+    // ARM (e.g. Apple Silicon): translate SSE intrinsics to NEON
+    #include "sse2neon.h"
+#else
+    #include <immintrin.h>
+#endif
 
 namespace SIMD
 {
