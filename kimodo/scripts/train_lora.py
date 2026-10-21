@@ -55,6 +55,7 @@ def parse_args():
     p.add_argument("--prior", type=float, default=0.0, help="prior preservation weight on style-0 rows (see --prior_mode)")
     p.add_argument("--prior_mode", default="replace", choices=["replace", "add", "data"], help="data: style-0 rows = real clips, ground-truth target, weight=prior (LoRA-MDM); replace: style-0 rows target the frozen base prediction (weight=prior); add: all rows target ground truth, plus prior*huber(pred, base_pred) on style-0 rows")
     p.add_argument("--paired", action="store_true", help="batches of twin pairs (same key, style 0 and 1) sharing noise and timestep")
+    p.add_argument("--prior_rows", type=int, default=0, help="with --paired: this many batch slots are random UNPAIRED natural rows (free prior), the rest twin pairs")
     p.add_argument("--targets", default=",".join(LORA_TARGETS), help="comma list of LoRA target module names (add self_attn for attention)")
     p.add_argument("--loss", default="huber", choices=["huber", "official"], help="official = tech-report per-block smooth-L1 weights (+ --fk_weight)")
     p.add_argument("--fk_weight", type=float, default=5.0, help="gamma_7: FK(pred rotations) vs target joint positions (only with --loss official)")
@@ -104,6 +105,9 @@ class PairDataset:
             if it["level"] == 0: groups[it["key"]][0] = i
             else: groups[it["key"]][1].append(i)
         self.pairs = [v for v in groups.values() if v[0] is not None and v[1]]
+        self.prior_rows = 0; self.n_paired = 0
+        paired_ids = {i for v in self.pairs for i in [v[0]] + list(v[1])}
+        self.extra = [it for j, it in enumerate(self.items) if j not in paired_ids and it["style"] == 0]   # naturals without a styled twin
         self.dim = self.items[0]["feat"].shape[-1]
         print(f"dataset: {len(self.items)} rows, {sum(i['feat'].shape[0] for i in self.items)} frames, "
               f"{len(set(i['caption'] for i in self.items))} captions, features in {time.time()-t0:.0f}s", flush=True)
@@ -112,11 +116,16 @@ class PairDataset:
         """Returns feats, texts, styles. Paired: consecutive items are the two twins of one clip, same window."""
         if paired:
             picks, wins = [], []
-            for _ in range(batch // 2):
+            n_extra = min(self.prior_rows, len(self.extra)) if self.extra else 0
+            self.n_paired = ((batch - n_extra) // 2) * 2
+            for _ in range(self.n_paired // 2):
                 pr = self.pairs[rng.randrange(len(self.pairs))]
                 a, b = self.items[pr[0]], self.items[pr[1][rng.randrange(len(pr[1]))]]
                 s = rng.randrange(0, max(a["feat"].shape[0] - max_frames, 0) + 1)
                 picks += [a, b]; wins += [s, s]
+            for _ in range(batch - self.n_paired):                               # unpaired prior rows: own window, own noise
+                it = self.extra[rng.randrange(len(self.extra))]
+                picks.append(it); wins.append(rng.randrange(0, max(it["feat"].shape[0] - max_frames, 0) + 1))
         elif balanced:                                                   # half style rows, half prior (style 0) rows
             st = [i for i in self.items if i["style"] == 1]; nt = [i for i in self.items if i["style"] == 0]
             picks = [st[rng.randrange(len(st))] for _ in range(batch // 2)] + [nt[rng.randrange(len(nt))] for _ in range(batch - batch // 2)]
@@ -137,10 +146,10 @@ def collate(feats, texts, motion_rep, device, cfg_dropout, rng, paired=False):
     B = len(feats); T = max(f.shape[0] for f in feats); D = feats[0].shape[-1]
     x0 = torch.zeros(B, T, D); pad = torch.zeros(B, T, dtype=torch.bool); heading = torch.zeros(B)
     for i, f in enumerate(feats):
-        if paired and i % 2 == 1:
+        if i < paired and i % 2 == 1:
             torch.manual_seed(seed_i)                                        # twin gets the same random heading
         seed_i = rng.randrange(1 << 30)
-        if paired and i % 2 == 0:
+        if i < paired and i % 2 == 0:
             torch.manual_seed(seed_i)
         canon = motion_rep.canonicalize_random_heading(f[None])              # frame 0 at origin, random heading
         heading[i] = motion_rep.get_first_heading_angle(canon, normalized=False)[0]
@@ -198,6 +207,8 @@ def main():
     diffusion.calc_diffusion_vars(use_t)                                     # full 1000-step schedule for training
 
     data = PairDataset(args.manifest, args.emb, motion_rep, skeleton, overfit=args.overfit)
+
+    data.prior_rows = args.prior_rows
     base = None
     if args.prior > 0 and args.prior_mode != "data":
         import copy
@@ -257,7 +268,8 @@ def main():
     t_start = time.time(); run_loss = 0.0; n_loss = 0
     for step in range(step0 + 1, args.steps + 1):
         feats, texts, styles = data.sample(args.batch, args.max_frames, rng, paired=args.paired, balanced=args.balanced)
-        x0, pad, text, tmask, heading = collate(feats, texts, motion_rep, device, args.cfg_dropout, rng, paired=args.paired)
+        n_paired = data.n_paired if args.paired else 0
+        x0, pad, text, tmask, heading = collate(feats, texts, motion_rep, device, args.cfg_dropout, rng, paired=n_paired)
         B, T, D = x0.shape
         if style_params:
             style_cond.set_level(backbone, data.last_levels)
@@ -267,8 +279,8 @@ def main():
                     text[i, 0] = data.last_plain[i].reshape(-1).to(device) + tag_delta
         t = torch.randint(0, diffusion.num_base_steps, (B,), device=device)
         noise = torch.randn_like(x0)
-        if args.paired:                                                      # twins share timestep and noise
-            t[1::2] = t[0::2]; noise[1::2] = noise[0::2]
+        if args.paired:                                                      # twins share timestep and noise (paired prefix only)
+            t[1:n_paired:2] = t[0:n_paired:2]; noise[1:n_paired:2] = noise[0:n_paired:2]
         xt = diffusion.q_sample(x0, t, noise)
         zeros = torch.zeros_like(x0)                                         # no kinematic constraints in round one
         pred = backbone(xt, pad, text, tmask, t, first_heading_angle=heading, motion_mask=zeros, observed_motion=zeros)
