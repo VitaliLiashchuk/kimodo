@@ -61,6 +61,8 @@ def parse_args():
     p.add_argument("--fk_weight", type=float, default=5.0, help="gamma_7: FK(pred rotations) vs target joint positions (only with --loss official)")
     p.add_argument("--balanced", action="store_true", help="each batch = half style rows, half prior (style 0) rows")
     p.add_argument("--dim_weights", default="", help=".pt with 'weights' [D]: per-channel loss weights (focus on channels the style changes)")
+    p.add_argument("--constraints", default="", choices=["", "feet"], help="feet: train with the eval-time constraint mask (feet every 2 frames, root path + heading, full body on first/last frame), observed values from the natural twin")
+    p.add_argument("--constraint_dropout", type=float, default=0.1, help="rows trained without constraints (keeps the unconditional CFG branch sane)")
     return p.parse_args()
 
 
@@ -163,6 +165,41 @@ def collate(feats, texts, motion_rep, device, cfg_dropout, rng, paired=False):
     return x0.to(device), pad.to(device), text.to(device), tmask.to(device), heading.to(device)
 
 
+def constraint_columns(motion_rep, skeleton, npz):
+    """Feature columns each make_feet_keys constraint type writes (fullbody / foot / root2d), read off Kimodo's own
+    encoder on a 4-frame stub: frame 0 = all three, frame 1 = root2d only, frame 2 = root2d + feet."""
+    from scipy.spatial.transform import Rotation as Rot
+    from kimodo.constraints import load_constraints_lst
+    d = np.load(npz); J = d["local_rot_mats"].shape[1]
+    def block(kind, idx):
+        aa = Rot.from_matrix(d["local_rot_mats"][idx].reshape(-1, 3, 3)).as_rotvec().reshape(len(idx), J, 3)
+        return {"type": kind, "frame_indices": idx, "local_joints_rot": aa.tolist(), "root_positions": d["root_positions"][idx].tolist(),
+                "smooth_root_2d": d["smooth_root_pos"][idx][:, [0, 2]].tolist()}
+    sets = [block("fullbody", [0]), block("left-foot", [2]), block("right-foot", [2]),
+            {"type": "root2d", "frame_indices": [0, 1, 2, 3], "smooth_root_2d": d["smooth_root_pos"][:4][:, [0, 2]].tolist(),
+             "global_root_heading": d["global_root_heading"][:4].tolist()}]
+    with torch.no_grad():
+        _, m = motion_rep.create_conditions_from_constraints(load_constraints_lst(sets, skeleton), 4, True, "cpu")
+    root = m[1] > 0; foot = (m[2] > 0) & ~root; fb = m[0] > 0
+    return {k: v.nonzero().squeeze(1) for k, v in (("root", root), ("foot", foot), ("fb", fb))}
+
+
+def constraint_mask(cols, pad, D, n_paired, rng, p_drop):
+    """[B, T, D] eval-style mask per row (root all frames, feet every 2nd frame, full body first + last); twins share it."""
+    B, T = pad.shape
+    m = torch.zeros(B, T, D)
+    for i in range(B):
+        if i < n_paired and i % 2 == 1:
+            m[i] = m[i - 1]; continue
+        if rng.random() < p_drop:
+            continue
+        L = int(pad[i].sum())
+        m[i, :L, cols["root"]] = 1
+        m[i, torch.arange(0, L, 2)[:, None], cols["foot"][None, :]] = 1
+        m[i, torch.tensor([0, L - 1])[:, None], cols["fb"][None, :]] = 1
+    return m
+
+
 def lora_state(model):
     return {k: v.detach().cpu().clone() for k, v in model.state_dict().items() if "lora_" in k}
 
@@ -261,6 +298,11 @@ def main():
     json.dump(vars(args), open(os.path.join(args.out, "args.json"), "w"), indent=1)
     log = open(os.path.join(args.out, "train.log"), "a")
 
+    ccols = None
+    if args.constraints == "feet":
+        ccols = constraint_columns(motion_rep, skeleton, json.load(open(args.manifest))["rows"][0]["npz"])
+        print(f"constraint-matched training: root {len(ccols['root'])} cols all frames, feet {len(ccols['foot'])} cols every 2nd frame, "
+              f"full body {len(ccols['fb'])} cols first/last frame, dropout {args.constraint_dropout}", flush=True)
     dim_w = torch.load(args.dim_weights)["weights"].float().to(device) if args.dim_weights else None
     if dim_w is not None:
         dim_w = dim_w / dim_w.mean()                                         # keep the loss scale comparable
@@ -282,13 +324,19 @@ def main():
         if args.paired:                                                      # twins share timestep and noise (paired prefix only)
             t[1:n_paired:2] = t[0:n_paired:2]; noise[1:n_paired:2] = noise[0:n_paired:2]
         xt = diffusion.q_sample(x0, t, noise)
-        zeros = torch.zeros_like(x0)                                         # no kinematic constraints in round one
-        pred = backbone(xt, pad, text, tmask, t, first_heading_angle=heading, motion_mask=zeros, observed_motion=zeros)
+        cmask = torch.zeros_like(x0)                                         # kinematic constraints: none, or the eval mask
+        if ccols is not None:
+            cmask = constraint_mask(ccols, pad.cpu(), D, n_paired, rng, args.constraint_dropout).to(device)
+        obs = x0.clone()
+        if n_paired:
+            obs[1:n_paired:2] = x0[0:n_paired:2]                             # style twin observes the NATURAL clip (as at eval)
+        obs = obs * cmask
+        pred = backbone(xt, pad, text, tmask, t, first_heading_angle=heading, motion_mask=cmask, observed_motion=obs)
         target = x0; row_w = torch.ones(B, 1, device=device)
         if base is not None:                                                 # prior preservation: natural rows -> base prediction
             st = torch.tensor(styles, device=device)
             with torch.no_grad():
-                base_pred = base(xt, pad, text, tmask, t, first_heading_angle=heading, motion_mask=zeros, observed_motion=zeros)
+                base_pred = base(xt, pad, text, tmask, t, first_heading_angle=heading, motion_mask=cmask, observed_motion=obs)
             nat = (st == 0)[:, None, None]
             if args.prior_mode == "replace":
                 target = torch.where(nat, base_pred, x0); row_w = torch.where(nat[:, :, 0], torch.full_like(row_w, args.prior), row_w)
